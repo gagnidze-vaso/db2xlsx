@@ -47,6 +47,10 @@ func main() {
 	}
 	defer db.Close()
 
+	db.SetConnMaxLifetime(0)
+	db.SetMaxIdleConns(3)
+	db.SetMaxOpenConns(3)
+
 	ctx, stop := context.WithCancel(context.Background())
 	defer stop()
 
@@ -61,20 +65,23 @@ func main() {
 	Ping(ctx)
 
 	rows, err := db.Query("SHOW TABLES")
+	if err != nil {
+		log.Fatalf("query tables: %v", err)
+	}
+	defer rows.Close()
 
-	var tableList []string
-
+	var tableNames []string
 	for rows.Next() {
 		var tableName string
-		rows.Scan(&tableName)
-
-		tableList = append(tableList, tableName)
+		if err = rows.Scan(&tableName); err != nil {
+			log.Fatalf("failed to scan table name: %v", err)
+		}
+		tableNames = append(tableNames, tableName)
 	}
 
 	// Check for errors during row iteration.
 	if err = rows.Err(); err != nil {
 		log.Fatal("rows scan error: ", err)
-		return
 	}
 
 	f := excelize.NewFile()
@@ -84,34 +91,39 @@ func main() {
 		}
 	}()
 
-	f.SetSheetName("Sheet1", tableList[0])
-	for _, table := range tableList {
+	f.SetSheetName("Sheet1", tableNames[0])
+
+	for _, table := range tableNames {
 		f.NewSheet(table)
 
 		query := fmt.Sprintf("SELECT * FROM %s", table)
-		rows, err = db.Query(query)
+		rows, err := db.QueryContext(ctx, query)
 		if err != nil {
-			panic(err)
+			log.Fatalf("query table %s: %v", table, err)
+			continue
 		}
+		defer rows.Close()
 
-		parsedTable := make([]map[string]any, 0)
+		var parsedTable []map[string]any
 
 		columns, _ := rows.Columns()
 
 		for rows.Next() {
-			raw := make([]any, len(columns))
+			columnPtrs := make([]any, len(columns))
 			for i := range columns {
-				raw[i] = new(any)
+				columnPtrs[i] = new(any)
 			}
 
-			rows.Scan(raw...)
+			if err = rows.Scan(columnPtrs...); err != nil {
+				log.Fatalf("failed to scan table `%s` columns: %v", table, err)
+			}
 
-			strColumn := make(map[string]any, len(columns))
+			dest := make(map[string]any, len(columns))
 			for i, column := range columns {
-				strColumn[column] = *raw[i].(*any)
+				dest[column] = *(columnPtrs[i].(*any))
 			}
 
-			parsedTable = append(parsedTable, strColumn)
+			parsedTable = append(parsedTable, dest)
 		}
 
 		// Check for errors during row iteration.
@@ -121,29 +133,22 @@ func main() {
 		}
 
 		for i, column := range columns {
-			cell, err := excelize.CoordinatesToCellName(i+1, 1)
-			if err != nil {
-				log.Fatal(err)
-			}
-
+			cell, _ := excelize.CoordinatesToCellName(i+1, 1)
 			f.SetCellValue(table, cell, column)
 		}
 
-		for i := 0; i < len(parsedTable); i++ {
+		for i, row := range parsedTable {
 			for j, column := range columns {
-				cell, err := excelize.CoordinatesToCellName(j+1, i+2)
-				if err != nil {
-					log.Fatal(err)
-				}
+				cell, _ := excelize.CoordinatesToCellName(j+1, i+2)
 
-				f.SetCellValue(table, cell, parsedTable[i][column])
+				f.SetCellValue(table, cell, row[column])
 			}
 		}
 	}
 
 	// Save spreadsheet by the given path.
 	fileName := fmt.Sprint(cfg.DBName, ".xlsx")
-	if err := f.SaveAs(fileName); err != nil {
+	if err = f.SaveAs(fileName); err != nil {
 		fmt.Println(err)
 	}
 }
